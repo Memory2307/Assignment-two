@@ -1,0 +1,83 @@
+import ballerinax/kafka;
+import ballerinax/mongodb;
+import ballerina/log;
+import ballerina/time;
+import ballerina/http;
+
+listener http:Listener paymentListener = new(8083);
+
+// MongoDB (store payment records)
+mongodb:Client mongoClient = check new("mongodb://mongo:27017", "transportDB");
+mongodb:Collection paymentsColl = check mongoClient.getCollection("payments");
+
+// Kafka consumer/producer
+kafka:Consumer paymentsReqConsumer = check new({
+    bootstrapServers: "kafka:9092",
+    groupId: "payment-service-group",
+    topics: ["payments.requests"],
+    pollingInterval: 1
+});
+kafka:Producer kafkaProducer = check new({ bootstrapServers: "kafka:9092" });
+
+// utility id
+function tsId(string prefix) returns string {
+    int ms = time:currentTime().unixTime * 1000;
+    return prefix + "-" + ms.toString();
+}
+
+service / on paymentListener {
+    resource function get health() returns json { return { service: "payment", status: "running" }; }
+    // simple endpoint to trigger a payment manually (alternate path)
+    resource function post process(http:Request req) returns json|http:BadRequest {
+        var p = req.getJsonPayload();
+        if p is json {
+            string pid = tsId("pay");
+            json pay = {"payment_id": pid, "ticket_id": p.ticket_id, "amount": p.amount, "status": "SUCCESS", "created_at": time:currentTime().toString()};
+            var ins = paymentsColl.insertOne(pay);
+            if ins is error {
+                log:printError("db insert failed", ins);
+                return http:BadRequest("db failed");
+            }
+            var send = kafkaProducer->send({ topic: "payments.processed", value: pay.toJsonString() });
+            if send is error {
+                log:printError("kafka send failed", send);
+            }
+            return pay;
+        }
+        return http:BadRequest("invalid");
+    }
+}
+
+isolated function processPaymentsRequests() returns error? {
+    while true {
+        kafka:ConsumerRecord[] recs = check paymentsReqConsumer->poll();
+        foreach var r in recs {
+            json req = check r.value.toJson();
+            log:printInfo("Processing payment request: " + req.toJsonString());
+            // simulate processing: 90% success
+            int roll = time:currentTime().unixTime % 10; // simple pseudo-random
+            boolean success = roll != 0;
+            string pid = tsId("pay");
+            json pay = {
+                "payment_id": pid,
+                "ticket_id": req.ticket_id ? "",
+                "user_id": req.user_id ? "",
+                "amount": req.amount ? 0,
+                "status": success ? "SUCCESS" : "FAILED",
+                "created_at": time:currentTime().toString()
+            };
+            // persist payment record
+            var ins = paymentsColl.insertOne(pay);
+            if ins is error {
+                log:printError("payments db insert failed", ins);
+            }
+            // publish result
+            var send = kafkaProducer->send({ topic: "payments.processed", value: pay.toJsonString() });
+            if send is error {
+                log:printError("kafka send failed", send);
+            }
+        }
+    }
+}
+
+checkpanic processPaymentsRequests();
